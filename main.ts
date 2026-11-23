@@ -202,32 +202,60 @@ function unifiedEdits(text: string, patchLinesArr: string[], strict: boolean): E
     if (line.startsWith('@@ ')) {
       if (!currentSec) throw new Exit2(`error: parse ${lineNum}`);
       inHeader = false;
-      const m = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+      const m = line.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
       if (!m) throw new Exit2(`error: parse ${lineNum}`);
       const A = parseInt(m[1]!, 10);
+      const oldLen = m[2] !== undefined ? parseInt(m[2], 10) : 1;
+      const newLen = m[4] !== undefined ? parseInt(m[4], 10) : 1;
       const hunkBody: { type: string; text: string; noNewline?: boolean }[] = [];
+      let oldCollected = 0;
+      let newCollected = 0;
       i++;
       while (i < patchLinesArr.length) {
+        if (oldCollected >= oldLen && newCollected >= newLen) {
+          break;
+        }
         const bl = patchLinesArr[i]!;
         if (bl.startsWith('diff --git ') || bl.startsWith('@@ ') || (bl.startsWith('--- ') && (patchLinesArr[i + 1] ?? '').startsWith('+++ '))) {
           break;
         }
-        if (bl === '') {
-          hunkBody.push({ type: ' ', text: '' });
-          i++;
-          continue;
-        }
-        const type = bl[0];
-        if (type === ' ' || type === '-' || type === '+') {
-          hunkBody.push({ type, text: bl.slice(1) });
-          i++;
-        } else if (bl.startsWith('\\ No newline at end of file')) {
+        if (bl.startsWith('\\ No newline at end of file')) {
           if (hunkBody.length > 0) {
             hunkBody[hunkBody.length - 1]!.noNewline = true;
           }
           i++;
+          continue;
+        }
+        let type: string;
+        let text: string;
+        if (bl === '') {
+          type = ' ';
+          text = '';
         } else {
-          break;
+          const t = bl[0];
+          if (t === ' ' || t === '-' || t === '+') {
+            type = t;
+            text = bl.slice(1);
+          } else {
+            break;
+          }
+        }
+        hunkBody.push({ type, text });
+        if (type === ' ' || type === '-') {
+          oldCollected++;
+        }
+        if (type === ' ' || type === '+') {
+          newCollected++;
+        }
+        i++;
+      }
+      if (oldCollected >= oldLen && newCollected >= newLen && i < patchLinesArr.length) {
+        const bl = patchLinesArr[i]!;
+        if (bl.startsWith('\\ No newline at end of file')) {
+          if (hunkBody.length > 0) {
+            hunkBody[hunkBody.length - 1]!.noNewline = true;
+          }
+          i++;
         }
       }
       currentSec.hunks.push({ headerLineNum: lineNum, A, body: hunkBody });
@@ -642,9 +670,13 @@ function v4aEdits(text: string, patchLinesArr: string[], strict: boolean): Edit[
           }
 
           const O: string[] = [];
+          const O_types: string[] = [];
           const N: string[] = [];
           for (const b of chunk.body) {
-            if (b.type === ' ' || b.type === '-') O.push(b.text);
+            if (b.type === ' ' || b.type === '-') {
+              O.push(b.text);
+              O_types.push(b.type);
+            }
             if (b.type === ' ' || b.type === '+') N.push(b.text);
           }
 
@@ -677,7 +709,7 @@ function v4aEdits(text: string, patchLinesArr: string[], strict: boolean): Edit[
                   if (matchTier === 2) {
                     const F = getLeading(lines[startIdx]!);
                     const P = getLeading(O[0]!);
-                    if (P !== '' && !blank(textToAdd) && textToAdd.startsWith(P)) {
+                    if (!blank(textToAdd) && textToAdd.startsWith(P)) {
                       textToAdd = F + textToAdd.slice(P.length);
                     }
                   }
@@ -695,12 +727,19 @@ function v4aEdits(text: string, patchLinesArr: string[], strict: boolean): Edit[
             let matchTier = -1;
             const maxTier = strict ? 0 : 2;
             for (let t = 0; t <= maxTier; t++) {
-              for (let idx = cursor; idx <= lines.length - O.length; idx++) {
+              for (let idx = cursor; idx <= lines.length; idx++) {
                 let match = true;
                 for (let j = 0; j < O.length; j++) {
-                  if (norm(lines[idx + j]!, t) !== norm(O[j]!, t)) {
-                    match = false;
-                    break;
+                  if (idx + j < lines.length) {
+                    if (norm(lines[idx + j]!, t) !== norm(O[j]!, t)) {
+                      match = false;
+                      break;
+                    }
+                  } else {
+                    if (O_types[j] !== ' ' || !blank(O[j]!)) {
+                      match = false;
+                      break;
+                    }
                   }
                 }
                 if (match) {
@@ -717,16 +756,18 @@ function v4aEdits(text: string, patchLinesArr: string[], strict: boolean): Edit[
             let nCursor = 0;
             for (const b of chunk.body) {
               if (b.type === ' ') {
-                subLines.push(lines[matchIdx + nCursor]!);
+                if (matchIdx + nCursor < lines.length) {
+                  subLines.push(lines[matchIdx + nCursor]!);
+                }
                 nCursor++;
               } else if (b.type === '-') {
                 nCursor++;
               } else if (b.type === '+') {
                 let textToAdd = b.text;
                 if (matchTier === 2) {
-                  const F = getLeading(lines[matchIdx]!);
+                  const F = matchIdx < lines.length ? getLeading(lines[matchIdx]!) : '';
                   const P = getLeading(O[0]!);
-                  if (P !== '' && !blank(textToAdd) && textToAdd.startsWith(P)) {
+                  if (!blank(textToAdd) && textToAdd.startsWith(P)) {
                     textToAdd = F + textToAdd.slice(P.length);
                   }
                 }
@@ -734,7 +775,8 @@ function v4aEdits(text: string, patchLinesArr: string[], strict: boolean): Edit[
               }
             }
 
-            lines.splice(matchIdx, O.length, ...subLines);
+            const deleteCount = Math.min(O.length, lines.length - matchIdx);
+            lines.splice(matchIdx, deleteCount, ...subLines);
             cursor = matchIdx + subLines.length;
           } else {
             lines.splice(cursor, 0, ...N);
